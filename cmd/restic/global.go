@@ -175,12 +175,16 @@ func create(u string) (backend.Backend, error) {
 		return local.Create(u)
 	}
 
-	url, err := url.Parse(u)
+	url, err := parse(u)
 	if err != nil {
+		fmt.Printf("Failure parsing Path: %v\n", u)
 		return nil, err
 	}
 
-	if url.Scheme == "" {
+	fmt.Printf("Creating Backend at: %+v\n", url)
+
+	if url.Scheme == "file" {
+		fmt.Printf("Creating local Backend at: %v\n", url.Path)
 		return local.Create(url.Path)
 	}
 
@@ -200,4 +204,35 @@ func create(u string) (backend.Backend, error) {
 	args = append(args, "-s")
 	args = append(args, "sftp")
 	return sftp.Create(url.Path[1:], "ssh", args...)
+}
+
+func parse(u string) (*url.URL, error) {
+	uri, err := url.Parse(u)
+	if err != nil {
+		return nil, err
+	}
+
+	if uri.Scheme == "" {
+		uri.Scheme = "file"
+	}
+
+	if uri.Host != "" {
+		uri.Path = uri.Host + "/"
+		uri.Host = ""
+	}
+
+	if uri.Scheme == "file" {
+		return uri, nil
+	}
+
+	if len(uri.Scheme) == 1 {
+		fmt.Printf("Windows Path: %+v\n", u)
+		// Windows Drive-Letter
+		uri = new(url.URL)
+		uri.Path = u
+		uri.Scheme = "file"
+		return uri, nil
+	}
+
+	return nil, errors.New("Invalid Path")
 }
