@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"strings"
 
 	"github.com/jessevdk/go-flags"
 	"github.com/restic/restic/backend"
@@ -23,6 +24,7 @@ type GlobalOptions struct {
 	Repo     string `short:"r" long:"repo"                      description:"Repository directory to backup to/restore from"`
 	CacheDir string `          long:"cache-dir"                 description:"Directory to use as a local cache"`
 	Quiet    bool   `short:"q" long:"quiet"     default:"false" description:"Do not output comprehensive progress report"`
+	NoLock   bool   `          long:"no-lock"   default:"false" description:"Do not lock the repo, this allows some operations on read-only repos."`
 
 	password string
 	stdout   io.Writer
@@ -77,19 +79,55 @@ func (o GlobalOptions) Exitf(exitcode int, format string, args ...interface{}) {
 	os.Exit(exitcode)
 }
 
+// readPassword reads the password from the given reader directly.
+func readPassword(in io.Reader) (password string, err error) {
+	buf := make([]byte, 1000)
+	n, err := io.ReadFull(in, buf)
+	buf = buf[:n]
+
+	if err != nil && err != io.ErrUnexpectedEOF {
+		return "", err
+	}
+
+	return strings.TrimRight(string(buf), "\r\n"), nil
+}
+
+// readPasswordTerminal reads the password from the given reader which must be a
+// tty. Prompt is printed on the writer out before attempting to read the
+// password.
+func readPasswordTerminal(in *os.File, out io.Writer, prompt string) (password string, err error) {
+	fmt.Fprint(out, prompt)
+	buf, err := terminal.ReadPassword(int(in.Fd()))
+	fmt.Fprintln(out)
+	if err != nil {
+		return "", err
+	}
+
+	password = string(buf)
+	return password, nil
+}
+
 func (o GlobalOptions) ReadPassword(prompt string) string {
-	fmt.Fprint(os.Stderr, prompt)
-	pw, err := terminal.ReadPassword(int(os.Stdin.Fd()))
+	var (
+		password string
+		err      error
+	)
+
+	if terminal.IsTerminal(int(os.Stdin.Fd())) {
+		password, err = readPasswordTerminal(os.Stdin, os.Stderr, prompt)
+	} else {
+		password, err = readPassword(os.Stdin)
+	}
+
 	if err != nil {
 		o.Exitf(2, "unable to read password: %v", err)
 	}
-	fmt.Fprintln(os.Stderr)
 
-	if len(pw) == 0 {
+	if len(password) == 0 {
 		o.Exitf(1, "an empty password is not a password")
 	}
 
-	return string(pw)
+	return password
 }
 
 func (o GlobalOptions) ReadPasswordTwice(prompt1, prompt2 string) string {

@@ -162,17 +162,13 @@ func (cmd CmdCat) Execute(args []string) error {
 		return err
 
 	case "blob":
-		_, blobType, _, length, err := repo.Index().Lookup(id)
+		blob, err := repo.Index().Lookup(id)
 		if err != nil {
 			return err
 		}
 
-		if blobType != pack.Data {
-			return errors.New("wrong type for blob")
-		}
-
-		buf := make([]byte, length)
-		data, err := repo.LoadBlob(pack.Data, id, buf)
+		buf := make([]byte, blob.Length)
+		data, err := repo.LoadBlob(blob.Type, id, buf)
 		if err != nil {
 			return err
 		}

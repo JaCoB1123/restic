@@ -61,15 +61,16 @@ func cmdBackupExcludes(t testing.TB, global GlobalOptions, target []string, pare
 	OK(t, cmd.Execute(target))
 }
 
-func cmdList(t testing.TB, global GlobalOptions, tpe string) []backend.ID {
-	var buf bytes.Buffer
-	global.stdout = &buf
+func cmdList(t testing.TB, global GlobalOptions, tpe string) backend.IDs {
 	cmd := &CmdList{global: &global}
+	return executeAndParseIDs(t, cmd, tpe)
+}
 
-	OK(t, cmd.Execute([]string{tpe}))
-	IDs := parseIDsFromReader(t, &buf)
-
-	return IDs
+func executeAndParseIDs(t testing.TB, cmd *CmdList, args ...string) backend.IDs {
+	buf := bytes.NewBuffer(nil)
+	cmd.global.stdout = buf
+	OK(t, cmd.Execute(args))
+	return parseIDsFromReader(t, buf)
 }
 
 func cmdRestore(t testing.TB, global GlobalOptions, dir string, snapshotID backend.ID) {
@@ -87,7 +88,11 @@ func cmdRestoreIncludes(t testing.TB, global GlobalOptions, dir string, snapshot
 }
 
 func cmdCheck(t testing.TB, global GlobalOptions) {
-	cmd := &CmdCheck{global: &global, ReadData: true}
+	cmd := &CmdCheck{
+		global:      &global,
+		ReadData:    true,
+		CheckUnused: true,
+	}
 	OK(t, cmd.Execute(nil))
 }
 
@@ -102,6 +107,11 @@ func cmdCheckOutput(t testing.TB, global GlobalOptions) string {
 func cmdRebuildIndex(t testing.TB, global GlobalOptions) {
 	global.stdout = ioutil.Discard
 	cmd := &CmdRebuildIndex{global: &global}
+	OK(t, cmd.Execute(nil))
+}
+
+func cmdOptimize(t testing.TB, global GlobalOptions) {
+	cmd := &CmdOptimize{global: &global}
 	OK(t, cmd.Execute(nil))
 }
 
@@ -288,6 +298,56 @@ func TestBackupMissingFile2(t *testing.T) {
 
 		Assert(t, ranHook, "hook did not run")
 		debug.RemoveHook("pipe.walk2")
+	})
+}
+
+func TestBackupDirectoryError(t *testing.T) {
+	withTestEnvironment(t, func(env *testEnvironment, global GlobalOptions) {
+		datafile := filepath.Join("testdata", "backup-data.tar.gz")
+		fd, err := os.Open(datafile)
+		if os.IsNotExist(err) {
+			t.Skipf("unable to find data file %q, skipping", datafile)
+			return
+		}
+		OK(t, err)
+		OK(t, fd.Close())
+
+		SetupTarTestFixture(t, env.testdata, datafile)
+
+		cmdInit(t, global)
+
+		global.stderr = ioutil.Discard
+		ranHook := false
+
+		testdir := filepath.Join(env.testdata, "0", "0", "9")
+
+		// install hook that removes the dir right before readdirnames()
+		debug.Hook("pipe.readdirnames", func(context interface{}) {
+			path := context.(string)
+
+			if path != testdir {
+				return
+			}
+
+			t.Logf("in hook, removing test file %v", testdir)
+			ranHook = true
+
+			OK(t, os.RemoveAll(testdir))
+		})
+
+		cmdBackup(t, global, []string{filepath.Join(env.testdata, "0", "0")}, nil)
+		cmdCheck(t, global)
+
+		Assert(t, ranHook, "hook did not run")
+		debug.RemoveHook("pipe.walk2")
+
+		snapshots := cmdList(t, global, "snapshots")
+		Assert(t, len(snapshots) > 0,
+			"no snapshots found in repo (%v)", datafile)
+
+		files := cmdLs(t, global, snapshots[0].String())
+
+		Assert(t, len(files) > 1, "snapshot is empty")
 	})
 }
 
@@ -688,4 +748,69 @@ func TestRebuildIndex(t *testing.T) {
 func TestRebuildIndexAlwaysFull(t *testing.T) {
 	repository.IndexFull = func(*repository.Index) bool { return true }
 	TestRebuildIndex(t)
+}
+
+var optimizeTests = []struct {
+	testFilename string
+	snapshots    backend.IDSet
+}{
+	{
+		filepath.Join("..", "..", "checker", "testdata", "checker-test-repo.tar.gz"),
+		backend.NewIDSet(ParseID("a13c11e582b77a693dd75ab4e3a3ba96538a056594a4b9076e4cacebe6e06d43")),
+	},
+	{
+		filepath.Join("testdata", "old-index-repo.tar.gz"),
+		nil,
+	},
+	{
+		filepath.Join("testdata", "old-index-repo.tar.gz"),
+		backend.NewIDSet(
+			ParseID("f7d83db709977178c9d1a09e4009355e534cde1a135b8186b8b118a3fc4fcd41"),
+			ParseID("51d249d28815200d59e4be7b3f21a157b864dc343353df9d8e498220c2499b02"),
+		),
+	},
+}
+
+func TestOptimizeRemoveUnusedBlobs(t *testing.T) {
+	for i, test := range optimizeTests {
+		withTestEnvironment(t, func(env *testEnvironment, global GlobalOptions) {
+			SetupTarTestFixture(t, env.base, test.testFilename)
+
+			for id := range test.snapshots {
+				OK(t, removeFile(filepath.Join(env.repo, "snapshots", id.String())))
+			}
+
+			cmdOptimize(t, global)
+			output := cmdCheckOutput(t, global)
+
+			if len(output) > 0 {
+				t.Errorf("expected no output for check in test %d, got:\n%v", i, output)
+			}
+		})
+	}
+}
+
+func TestCheckRestoreNoLock(t *testing.T) {
+	withTestEnvironment(t, func(env *testEnvironment, global GlobalOptions) {
+		datafile := filepath.Join("testdata", "small-repo.tar.gz")
+		SetupTarTestFixture(t, env.base, datafile)
+
+		err := filepath.Walk(env.repo, func(p string, fi os.FileInfo, e error) error {
+			if e != nil {
+				return e
+			}
+			return os.Chmod(p, fi.Mode() & ^(os.FileMode(0222)))
+		})
+		OK(t, err)
+
+		global.NoLock = true
+		cmdCheck(t, global)
+
+		snapshotIDs := cmdList(t, global, "snapshots")
+		if len(snapshotIDs) == 0 {
+			t.Fatalf("found no snapshots")
+		}
+
+		cmdRestore(t, global, filepath.Join(env.base, "restore"), snapshotIDs[0])
+	})
 }

@@ -4,14 +4,17 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"time"
 
-	"github.com/restic/restic/backend"
+	"golang.org/x/crypto/ssh/terminal"
+
+	"github.com/restic/restic"
 	"github.com/restic/restic/checker"
 )
 
 type CmdCheck struct {
-	ReadData       bool `long:"read-data"  description:"Read data blobs" default:"false"`
-	RemoveOrphaned bool `long:"remove"     description:"Remove data that isn't used" default:"false"`
+	ReadData    bool `long:"read-data"    default:"false" description:"Read data blobs"`
+	CheckUnused bool `long:"check-unused" default:"false" description:"Check for unused blobs"`
 
 	global *GlobalOptions
 }
@@ -30,6 +33,37 @@ func (cmd CmdCheck) Usage() string {
 	return "[check-options]"
 }
 
+func (cmd CmdCheck) newReadProgress(todo restic.Stat) *restic.Progress {
+	if !cmd.global.ShowProgress() {
+		return nil
+	}
+
+	readProgress := restic.NewProgress(time.Second)
+
+	readProgress.OnUpdate = func(s restic.Stat, d time.Duration, ticker bool) {
+		status := fmt.Sprintf("[%s] %s  %d / %d items",
+			formatDuration(d),
+			formatPercent(s.Blobs, todo.Blobs),
+			s.Blobs, todo.Blobs)
+
+		w, _, err := terminal.GetSize(int(os.Stdout.Fd()))
+		if err == nil {
+			if len(status) > w {
+				max := w - len(status) - 4
+				status = status[:max] + "... "
+			}
+		}
+
+		fmt.Printf("\x1b[2K%s\r", status)
+	}
+
+	readProgress.OnDone = func(s restic.Stat, d time.Duration, ticker bool) {
+		fmt.Printf("\nduration: %s\n", formatDuration(d))
+	}
+
+	return readProgress
+}
+
 func (cmd CmdCheck) Execute(args []string) error {
 	if len(args) != 0 {
 		return errors.New("check has no arguments")
@@ -40,11 +74,13 @@ func (cmd CmdCheck) Execute(args []string) error {
 		return err
 	}
 
-	cmd.global.Verbosef("Create exclusive lock for repository\n")
-	lock, err := lockRepoExclusive(repo)
-	defer unlockRepo(lock)
-	if err != nil {
-		return err
+	if !cmd.global.NoLock {
+		cmd.global.Verbosef("Create exclusive lock for repository\n")
+		lock, err := lockRepoExclusive(repo)
+		defer unlockRepo(lock)
+		if err != nil {
+			return err
+		}
 	}
 
 	chkr := checker.New(repo)
@@ -80,14 +116,9 @@ func (cmd CmdCheck) Execute(args []string) error {
 	cmd.global.Verbosef("Check all packs\n")
 	go chkr.Packs(errChan, done)
 
-	foundOrphanedPacks := false
 	for err := range errChan {
 		errorsFound = true
 		fmt.Fprintf(os.Stderr, "%v\n", err)
-
-		if e, ok := err.(checker.PackError); ok && e.Orphaned {
-			foundOrphanedPacks = true
-		}
 	}
 
 	cmd.global.Verbosef("Check snapshots, trees and blobs\n")
@@ -106,21 +137,25 @@ func (cmd CmdCheck) Execute(args []string) error {
 		}
 	}
 
-	for _, id := range chkr.UnusedBlobs() {
-		cmd.global.Verbosef("unused blob %v\n", id.Str())
+	if cmd.CheckUnused {
+		for _, id := range chkr.UnusedBlobs() {
+			cmd.global.Verbosef("unused blob %v\n", id.Str())
+			errorsFound = true
+		}
 	}
 
-	if foundOrphanedPacks && cmd.RemoveOrphaned {
-		IDs := chkr.OrphanedPacks()
-		cmd.global.Verbosef("Remove %d orphaned packs... ", len(IDs))
+	if cmd.ReadData {
+		cmd.global.Verbosef("Read all data\n")
 
-		for _, id := range IDs {
-			if err := repo.Backend().Remove(backend.Data, id.String()); err != nil {
-				fmt.Fprintf(os.Stderr, "%v\n", err)
-			}
+		p := cmd.newReadProgress(restic.Stat{Blobs: chkr.CountPacks()})
+		errChan := make(chan error)
+
+		go chkr.ReadData(p, errChan, done)
+
+		for err := range errChan {
+			errorsFound = true
+			fmt.Fprintf(os.Stderr, "%v\n", err)
 		}
-
-		cmd.global.Verbosef("done\n")
 	}
 
 	if errorsFound {

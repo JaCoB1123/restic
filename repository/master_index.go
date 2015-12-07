@@ -33,24 +33,23 @@ func NewMasterIndex() *MasterIndex {
 }
 
 // Lookup queries all known Indexes for the ID and returns the first match.
-func (mi *MasterIndex) Lookup(id backend.ID) (packID backend.ID, tpe pack.BlobType, offset, length uint, err error) {
+func (mi *MasterIndex) Lookup(id backend.ID) (blob PackedBlob, err error) {
 	mi.idxMutex.RLock()
 	defer mi.idxMutex.RUnlock()
 
 	debug.Log("MasterIndex.Lookup", "looking up id %v", id.Str())
 
 	for _, idx := range mi.idx {
-		packID, tpe, offset, length, err = idx.Lookup(id)
+		blob, err = idx.Lookup(id)
 		if err == nil {
 			debug.Log("MasterIndex.Lookup",
-				"found id %v in pack %v at offset %d with length %d",
-				id.Str(), packID.Str(), offset, length)
+				"found id %v: %v", id.Str(), blob)
 			return
 		}
 	}
 
 	debug.Log("MasterIndex.Lookup", "id %v not found in any index", id.Str())
-	return backend.ID{}, pack.Data, 0, 0, fmt.Errorf("id %v not found in any index", id)
+	return PackedBlob{}, fmt.Errorf("id %v not found in any index", id)
 }
 
 // LookupSize queries all known Indexes for the ID and returns the first match.
@@ -66,6 +65,22 @@ func (mi *MasterIndex) LookupSize(id backend.ID) (uint, error) {
 	}
 
 	return 0, fmt.Errorf("id %v not found in any index", id)
+}
+
+// ListPack returns the list of blobs in a pack. The first matching index is
+// returned, or nil if no index contains information about the pack id.
+func (mi *MasterIndex) ListPack(id backend.ID) (list []PackedBlob) {
+	mi.idxMutex.RLock()
+	defer mi.idxMutex.RUnlock()
+
+	for _, idx := range mi.idx {
+		list := idx.ListPack(id)
+		if len(list) > 0 {
+			return list
+		}
+	}
+
+	return nil
 }
 
 // Has queries all known Indexes for the ID and returns the first match.
@@ -224,4 +239,50 @@ func (mi *MasterIndex) All() []*Index {
 	defer mi.idxMutex.Unlock()
 
 	return mi.idx
+}
+
+// RebuildIndex combines all known indexes to a new index, leaving out any
+// packs whose ID is contained in packBlacklist. The new index contains the IDs
+// of all known indexes in the "supersedes" field.
+func (mi *MasterIndex) RebuildIndex(packBlacklist backend.IDSet) (*Index, error) {
+	mi.idxMutex.Lock()
+	defer mi.idxMutex.Unlock()
+
+	debug.Log("MasterIndex.RebuildIndex", "start rebuilding index of %d indexes, pack blacklist: %v", len(mi.idx), packBlacklist)
+
+	newIndex := NewIndex()
+	done := make(chan struct{})
+	defer close(done)
+
+	for i, idx := range mi.idx {
+		debug.Log("MasterIndex.RebuildIndex", "adding index %d", i)
+
+		for pb := range idx.Each(done) {
+			if packBlacklist.Has(pb.PackID) {
+				continue
+			}
+
+			newIndex.Store(pb)
+		}
+
+		if !idx.Final() {
+			debug.Log("MasterIndex.RebuildIndex", "index %d isn't final, don't add to supersedes field", i)
+			continue
+		}
+
+		id, err := idx.ID()
+		if err != nil {
+			debug.Log("MasterIndex.RebuildIndex", "index %d does not have an ID: %v", err)
+			return nil, err
+		}
+
+		debug.Log("MasterIndex.RebuildIndex", "adding index id %v to supersedes field", id.Str())
+
+		err = newIndex.AddToSupersedes(id)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return newIndex, nil
 }

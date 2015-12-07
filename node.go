@@ -10,12 +10,13 @@ import (
 	"syscall"
 	"time"
 
+	"runtime"
+
 	"github.com/juju/errors"
 	"github.com/restic/restic/backend"
 	"github.com/restic/restic/debug"
 	"github.com/restic/restic/pack"
 	"github.com/restic/restic/repository"
-	"runtime"
 )
 
 // Node is a file, directory or other item in a backup.
@@ -212,14 +213,14 @@ func (node Node) createFileAt(path string, repo *repository.Repository) error {
 
 	var buf []byte
 	for _, id := range node.Content {
-		_, _, _, length, err := repo.Index().Lookup(id)
+		blob, err := repo.Index().Lookup(id)
 		if err != nil {
 			return err
 		}
 
 		buf = buf[:cap(buf)]
-		if uint(len(buf)) < length {
-			buf = make([]byte, length)
+		if uint(len(buf)) < blob.Length {
+			buf = make([]byte, blob.Length)
 		}
 
 		buf, err := repo.LoadBlob(pack.Data, id, buf)

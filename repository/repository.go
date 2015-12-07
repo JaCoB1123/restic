@@ -9,9 +9,7 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
-	"sync"
 
-	"github.com/restic/chunker"
 	"github.com/restic/restic/backend"
 	"github.com/restic/restic/crypto"
 	"github.com/restic/restic/debug"
@@ -26,8 +24,7 @@ type Repository struct {
 	keyName string
 	idx     *MasterIndex
 
-	pm    sync.Mutex
-	packs []*pack.Packer
+	*packerManager
 }
 
 // New returns a new repository with backend be.
@@ -35,6 +32,9 @@ func New(be backend.Backend) *Repository {
 	return &Repository{
 		be:  be,
 		idx: NewMasterIndex(),
+		packerManager: &packerManager{
+			be: be,
+		},
 	}
 }
 
@@ -92,32 +92,33 @@ func (r *Repository) LoadAndDecrypt(t backend.Type, id backend.ID) ([]byte, erro
 func (r *Repository) LoadBlob(t pack.BlobType, id backend.ID, plaintextBuf []byte) ([]byte, error) {
 	debug.Log("Repo.LoadBlob", "load %v with id %v", t, id.Str())
 	// lookup pack
-	packID, tpe, offset, length, err := r.idx.Lookup(id)
+	blob, err := r.idx.Lookup(id)
 	if err != nil {
 		debug.Log("Repo.LoadBlob", "id %v not found in index: %v", id.Str(), err)
 		return nil, err
 	}
 
-	if length > uint(cap(plaintextBuf))+crypto.Extension {
-		return nil, fmt.Errorf("buf is too small, need %d more bytes", length-uint(cap(plaintextBuf))-crypto.Extension)
+	plaintextBufSize := uint(cap(plaintextBuf))
+	if blob.PlaintextLength() > plaintextBufSize {
+		return nil, fmt.Errorf("buf is too small, need %d more bytes", blob.PlaintextLength()-plaintextBufSize)
 	}
 
-	if tpe != t {
-		debug.Log("Repo.LoadBlob", "wrong type returned for %v: wanted %v, got %v", id.Str(), t, tpe)
-		return nil, fmt.Errorf("blob has wrong type %v (wanted: %v)", tpe, t)
+	if blob.Type != t {
+		debug.Log("Repo.LoadBlob", "wrong type returned for %v: wanted %v, got %v", id.Str(), t, blob.Type)
+		return nil, fmt.Errorf("blob has wrong type %v (wanted: %v)", blob.Type, t)
 	}
 
-	debug.Log("Repo.LoadBlob", "id %v found in pack %v at offset %v (length %d)", id.Str(), packID.Str(), offset, length)
+	debug.Log("Repo.LoadBlob", "id %v found: %v", id.Str(), blob)
 
 	// load blob from pack
-	rd, err := r.be.GetReader(backend.Data, packID.String(), offset, length)
+	rd, err := r.be.GetReader(backend.Data, blob.PackID.String(), blob.Offset, blob.Length)
 	if err != nil {
-		debug.Log("Repo.LoadBlob", "error loading pack %v for %v: %v", packID.Str(), id.Str(), err)
+		debug.Log("Repo.LoadBlob", "error loading blob %v: %v", blob, err)
 		return nil, err
 	}
 
 	// make buffer that is large enough for the complete blob
-	ciphertextBuf := make([]byte, length)
+	ciphertextBuf := make([]byte, blob.Length)
 	_, err = io.ReadFull(rd, ciphertextBuf)
 	if err != nil {
 		return nil, err
@@ -142,19 +143,29 @@ func (r *Repository) LoadBlob(t pack.BlobType, id backend.ID, plaintextBuf []byt
 	return plaintextBuf, nil
 }
 
+// closeOrErr calls cl.Close() and sets err to the returned error value if
+// itself is not yet set.
+func closeOrErr(cl io.Closer, err *error) {
+	e := cl.Close()
+	if *err != nil {
+		return
+	}
+	*err = e
+}
+
 // LoadJSONUnpacked decrypts the data and afterwards calls json.Unmarshal on
 // the item.
-func (r *Repository) LoadJSONUnpacked(t backend.Type, id backend.ID, item interface{}) error {
+func (r *Repository) LoadJSONUnpacked(t backend.Type, id backend.ID, item interface{}) (err error) {
 	// load blob from backend
 	rd, err := r.be.Get(t, id.String())
 	if err != nil {
 		return err
 	}
-	defer rd.Close()
+	defer closeOrErr(rd, &err)
 
 	// decrypt
 	decryptRd, err := crypto.DecryptFrom(r.key, rd)
-	defer decryptRd.Close()
+	defer closeOrErr(decryptRd, &err)
 	if err != nil {
 		return err
 	}
@@ -171,23 +182,23 @@ func (r *Repository) LoadJSONUnpacked(t backend.Type, id backend.ID, item interf
 
 // LoadJSONPack calls LoadBlob() to load a blob from the backend, decrypt the
 // data and afterwards call json.Unmarshal on the item.
-func (r *Repository) LoadJSONPack(t pack.BlobType, id backend.ID, item interface{}) error {
+func (r *Repository) LoadJSONPack(t pack.BlobType, id backend.ID, item interface{}) (err error) {
 	// lookup pack
-	packID, _, offset, length, err := r.idx.Lookup(id)
+	blob, err := r.idx.Lookup(id)
 	if err != nil {
 		return err
 	}
 
 	// load blob from pack
-	rd, err := r.be.GetReader(backend.Data, packID.String(), offset, length)
+	rd, err := r.be.GetReader(backend.Data, blob.PackID.String(), blob.Offset, blob.Length)
 	if err != nil {
 		return err
 	}
-	defer rd.Close()
+	defer closeOrErr(rd, &err)
 
 	// decrypt
 	decryptRd, err := crypto.DecryptFrom(r.key, rd)
-	defer decryptRd.Close()
+	defer closeOrErr(decryptRd, &err)
 	if err != nil {
 		return err
 	}
@@ -205,83 +216,6 @@ func (r *Repository) LoadJSONPack(t pack.BlobType, id backend.ID, item interface
 // LookupBlobSize returns the size of blob id.
 func (r *Repository) LookupBlobSize(id backend.ID) (uint, error) {
 	return r.idx.LookupSize(id)
-}
-
-const minPackSize = 4 * chunker.MiB
-const maxPackSize = 16 * chunker.MiB
-const maxPackers = 200
-
-// findPacker returns a packer for a new blob of size bytes. Either a new one is
-// created or one is returned that already has some blobs.
-func (r *Repository) findPacker(size uint) (*pack.Packer, error) {
-	r.pm.Lock()
-	defer r.pm.Unlock()
-
-	// search for a suitable packer
-	if len(r.packs) > 0 {
-		debug.Log("Repo.findPacker", "searching packer for %d bytes\n", size)
-		for i, p := range r.packs {
-			if p.Size()+size < maxPackSize {
-				debug.Log("Repo.findPacker", "found packer %v", p)
-				// remove from list
-				r.packs = append(r.packs[:i], r.packs[i+1:]...)
-				return p, nil
-			}
-		}
-	}
-
-	// no suitable packer found, return new
-	blob, err := r.be.Create()
-	if err != nil {
-		return nil, err
-	}
-	debug.Log("Repo.findPacker", "create new pack %p for %d bytes", blob, size)
-	return pack.NewPacker(r.key, blob), nil
-}
-
-// insertPacker appends p to s.packs.
-func (r *Repository) insertPacker(p *pack.Packer) {
-	r.pm.Lock()
-	defer r.pm.Unlock()
-
-	r.packs = append(r.packs, p)
-	debug.Log("Repo.insertPacker", "%d packers\n", len(r.packs))
-}
-
-// savePacker stores p in the backend.
-func (r *Repository) savePacker(p *pack.Packer) error {
-	debug.Log("Repo.savePacker", "save packer with %d blobs\n", p.Count())
-	_, err := p.Finalize()
-	if err != nil {
-		return err
-	}
-
-	// move file to the final location
-	sid := p.ID()
-	err = p.Writer().(backend.Blob).Finalize(backend.Data, sid.String())
-	if err != nil {
-		debug.Log("Repo.savePacker", "blob Finalize() error: %v", err)
-		return err
-	}
-
-	debug.Log("Repo.savePacker", "saved as %v", sid.Str())
-
-	// update blobs in the index
-	for _, b := range p.Blobs() {
-		debug.Log("Repo.savePacker", "  updating blob %v to pack %v", b.ID.Str(), sid.Str())
-		r.idx.Current().Store(b.Type, b.ID, sid, b.Offset, uint(b.Length))
-		r.idx.RemoveFromInFlight(b.ID)
-	}
-
-	return nil
-}
-
-// countPacker returns the number of open (unfinished) packers.
-func (r *Repository) countPacker() int {
-	r.pm.Lock()
-	defer r.pm.Unlock()
-
-	return len(r.packs)
 }
 
 // SaveAndEncrypt encrypts data and stores it to the backend as type t. If data is small
@@ -525,7 +459,8 @@ func SaveIndex(repo *Repository, index *Index) (backend.ID, error) {
 	}
 
 	sid := blob.ID()
-	return sid, nil
+	err = index.SetID(sid)
+	return sid, err
 }
 
 // saveIndex saves all indexes in the backend.
@@ -609,35 +544,6 @@ func LoadIndex(repo *Repository, id string) (*Index, error) {
 	return nil, err
 }
 
-// decryptReadCloser couples an underlying reader with a DecryptReader and
-// implements io.ReadCloser. On Close(), both readers are closed.
-type decryptReadCloser struct {
-	r  io.ReadCloser
-	dr io.ReadCloser
-}
-
-func newDecryptReadCloser(key *crypto.Key, rd io.ReadCloser) (io.ReadCloser, error) {
-	dr, err := crypto.DecryptFrom(key, rd)
-	if err != nil {
-		return nil, err
-	}
-
-	return &decryptReadCloser{r: rd, dr: dr}, nil
-}
-
-func (dr *decryptReadCloser) Read(buf []byte) (int, error) {
-	return dr.dr.Read(buf)
-}
-
-func (dr *decryptReadCloser) Close() error {
-	err := dr.dr.Close()
-	if err != nil {
-		return err
-	}
-
-	return dr.r.Close()
-}
-
 // GetDecryptReader opens the file id stored in the backend and returns a
 // reader that yields the decrypted content. The reader must be closed.
 func (r *Repository) GetDecryptReader(t backend.Type, id string) (io.ReadCloser, error) {
@@ -649,25 +555,6 @@ func (r *Repository) GetDecryptReader(t backend.Type, id string) (io.ReadCloser,
 	return newDecryptReadCloser(r.key, rd)
 }
 
-// LoadIndexWithDecoder loads the index and decodes it with fn.
-func LoadIndexWithDecoder(repo *Repository, id string, fn func(io.Reader) (*Index, error)) (*Index, error) {
-	debug.Log("LoadIndexWithDecoder", "Loading index %v", id[:8])
-
-	rd, err := repo.GetDecryptReader(backend.Index, id)
-	if err != nil {
-		return nil, err
-	}
-	defer rd.Close()
-
-	idx, err := fn(rd)
-	if err != nil {
-		debug.Log("LoadIndexWithDecoder", "error while decoding index %v: %v", id, err)
-		return nil, err
-	}
-
-	return idx, nil
-}
-
 // SearchKey finds a key with the supplied password, afterwards the config is
 // read and parsed.
 func (r *Repository) SearchKey(password string) error {
@@ -677,6 +564,7 @@ func (r *Repository) SearchKey(password string) error {
 	}
 
 	r.key = key.master
+	r.packerManager.key = key.master
 	r.keyName = key.Name()
 	r.Config, err = LoadConfig(r)
 	return err
@@ -699,6 +587,7 @@ func (r *Repository) Init(password string) error {
 	}
 
 	r.key = key.master
+	r.packerManager.key = key.master
 	r.keyName = key.Name()
 	r.Config, err = CreateConfig(r)
 	return err
