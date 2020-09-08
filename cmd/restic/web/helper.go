@@ -15,7 +15,7 @@ import (
 
 func splitPath(path string) []string {
 	d, f := filepath.Split(path)
-	if d == "" || d == "/" {
+	if d == "" || d == "/" || d == "\\" {
 		return []string{f}
 	}
 	s := splitPath(filepath.Clean(d))
