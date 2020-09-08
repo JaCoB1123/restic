@@ -35,13 +35,12 @@ func dumpNode(ctx context.Context, repo restic.Repository, node *restic.Node, wr
 			buf = restic.NewBlobBuffer(int(size))
 		}
 
-		n, err := repo.LoadBlob(ctx, restic.DataBlob, id, buf)
+		blob, err := repo.LoadBlob(ctx, restic.DataBlob, id, buf)
 		if err != nil {
 			return err
 		}
-		buf = buf[:n]
 
-		_, err = writer.Write(buf)
+		_, err = writer.Write(blob)
 		if err != nil {
 			return errors.Wrap(err, "Write")
 		}
@@ -89,7 +88,7 @@ func restore(repo restic.Repository, snapshotID restic.ID, files []string, targe
 	}
 
 	totalErrors := 0
-	res.Error = func(dir string, node *restic.Node, err error) error {
+	res.Error = func(dir string, err error) error {
 		fmt.Fprintf(os.Stdout, "ignoring error for %s: %s\n", dir, err)
 		totalErrors++
 		return nil
