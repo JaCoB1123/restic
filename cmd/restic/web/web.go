@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+	"net/url"
 
 	"github.com/gorilla/mux"
 	homedir "github.com/mitchellh/go-homedir"
@@ -73,7 +74,7 @@ func getWebSnapshotDownload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	w.Header().Add("Content-Disposition", "Attachment; filename="+node.Name)
+	w.Header().Add("Content-Disposition", "Attachment; filename="+url.PathEscape(node.Name))
 	w.Header().Set("Content-Length", fmt.Sprintf("%v", node.Size))
 	err = dumpNode(ctx, webRepository, node, w)
 	if err != nil {
