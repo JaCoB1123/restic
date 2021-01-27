@@ -82,7 +82,10 @@ func findNode(ctx context.Context, tree *restic.Tree, repo restic.Repository, pr
 }
 
 func restore(repo restic.Repository, snapshotID restic.ID, files []string, target string) (int, error) {
-	res, err := restorer.NewRestorer(repo, snapshotID)
+	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
+
+	res, err := restorer.NewRestorer(ctx, repo, snapshotID)
 	if err != nil {
 		return 0, errors.Errorf("creating restorer failed: %v", err)
 	}

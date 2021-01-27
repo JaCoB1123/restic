@@ -48,7 +48,7 @@ func getSnapshots(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(context.TODO())
 	defer cancel()
 
-	snapshots, err := restic.LoadAllSnapshots(ctx, webRepository)
+	snapshots, err := restic.FindFilteredSnapshots(ctx, webRepository, nil, nil, nil)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
@@ -61,6 +61,9 @@ func getSnapshots(w http.ResponseWriter, r *http.Request) {
 }
 
 func createSnapshotRestore(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
+
 	type restoreTask struct {
 		Target string   `json:"target"`
 		Files  []string `json:"files"`
@@ -83,7 +86,7 @@ func createSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	params := mux.Vars(r)
-	snapshotID, err := restic.FindSnapshot(webRepository, params["id"])
+	snapshotID, err := restic.FindSnapshot(ctx, webRepository, params["id"])
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -100,15 +103,16 @@ func createSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 // Nodes
 
 func getSnapshotNodes(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
+
 	params := mux.Vars(r)
 
-	id, err := restic.FindSnapshot(webRepository, params["snapshot_id"])
+	id, err := restic.FindSnapshot(ctx, webRepository, params["snapshot_id"])
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	ctx, cancel := context.WithCancel(context.TODO())
-	defer cancel()
 
 	sn, err := restic.LoadSnapshot(ctx, webRepository, id)
 	if err != nil {

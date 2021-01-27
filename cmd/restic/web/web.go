@@ -46,18 +46,19 @@ func getWebSnapshots(w http.ResponseWriter, r *http.Request) {
 }
 
 func getWebSnapshotDownload(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
+
 	params := mux.Vars(r)
 
 	snapshotID := params["snapshot_id"]
 	splittedPath := splitPath(r.URL.Query().Get("path"))
 
-	id, err := restic.FindSnapshot(webRepository, snapshotID)
+	id, err := restic.FindSnapshot(ctx, webRepository, snapshotID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	ctx, cancel := context.WithCancel(context.TODO())
-	defer cancel()
 
 	sn, err := restic.LoadSnapshot(ctx, webRepository, id)
 	if err != nil {
