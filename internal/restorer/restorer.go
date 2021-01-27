@@ -2,6 +2,7 @@ package restorer
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -205,6 +206,7 @@ func (res *Restorer) restoreEmptyFileAt(node *restic.Node, target, location stri
 // RestoreTo creates the directories and files in the snapshot below dst.
 // Before an item is created, res.Filter is called.
 func (res *Restorer) RestoreTo(ctx context.Context, dst string) error {
+	fmt.Println("Restoring to", dst)
 	var err error
 	if !filepath.IsAbs(dst) {
 		dst, err = filepath.Abs(dst)

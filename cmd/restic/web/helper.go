@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -72,7 +73,7 @@ func findNode(ctx context.Context, tree *restic.Tree, repo restic.Repository, pr
 				}
 				return findNode(ctx, subtree, repo, item, pathComponents[1:])
 			case l > 1:
-				return nil, fmt.Errorf("%q should be a dir, but s a %q", item, node.Type)
+				return nil, fmt.Errorf("%q should be a dir, but is a %q", item, node.Type)
 			case node.Type != "file":
 				return nil, fmt.Errorf("%q should be a file, but is a %q", item, node.Type)
 			}
@@ -98,7 +99,9 @@ func restore(repo restic.Repository, snapshotID restic.ID, files []string, targe
 	}
 
 	compareFunc := func(files []string, item string) (bool, bool) {
+		item = path.Clean(item)
 		for _, f := range files {
+			f = path.Clean(f)
 			if strings.Compare(f, item) == 0 {
 				return true, true
 			} else if strings.HasPrefix(f, item) {
@@ -107,6 +110,7 @@ func restore(repo restic.Repository, snapshotID restic.ID, files []string, targe
 				return true, true
 			}
 		}
+		fmt.Println("Couldn't find", item, "in", files)
 		return false, false
 
 	}
