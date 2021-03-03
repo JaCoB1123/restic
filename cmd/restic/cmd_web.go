@@ -55,7 +55,7 @@ func runWeb(opts WebOptions, gopts GlobalOptions, args []string) error {
 	fs := http.FileServer(http.Dir("templates/web/static"))
 	router.PathPrefix("/static/").Handler(http.StripPrefix("/static/", fs))
 
-	Verbosef("http://localhost:8080/web/\n")
+	Verbosef("http://localhost:8084/web/\n")
 
-	return http.ListenAndServe(":8080", router)
+	return http.ListenAndServe(":8084", router)
 }
